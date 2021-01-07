@@ -1,0 +1,13 @@
+.idea/
+__pycache__/
+checkpoints/
+corpus/
+*.bin
+for_test.ipynb
+test.py
+config/__pycache__/
+models/__pycache__/
+preprocess/__pycache__/
+utils/__pycache__/
+pre_trained_models/
+state_dict/
