@@ -11,184 +11,103 @@ import tqdm
 import torch.nn.functional as F
 import time
 from sklearn.metrics import f1_score
+from transformers import BertModel, BertConfig, AdamW
 
+class Vocab:
+    def __init__(self, df, vocab_file, max_len=512, segment_num=2):
+        self.max_len = max_len
+        self.segment_num = segment_num
+        self._id2word, self._word2id = self.load_vocab(df, vocab_file)
+        self.unk = self._word2id.get('[UNK]')
+        self.num_label = len(np.unique(df.label.values))
 
-"""
-任务: 多分类
-模型: TextCNN
-"""
-
-
-class NewsVocab():
-    """
-    构建字典:
-    train_data.keys(): ['text', 'label']
-    train_data['text']: iterable of iterables
-    train_data['label']: iterable
-    """
-    def __init__(self, train_data, min_count=5):
-        self.min_count = min_count
-        self.pad = 0
-        self.unk = 1
-
-        self._id2word = ['[PAD]', '[UNK]']
-
-        self._id2label = []
-        self.target_names = []
-
-        self.build_vocab(train_data)
-
-        reverse = lambda x: dict(zip(x, range(len(x))))
-        self._word2id = reverse(self._id2word)
-        self._label2id = reverse(self._id2label)
-
-        logging.info("Build vocab: words %d, labels %d." % (self.word_size, self.label_size))
-
-    def build_vocab(self, data):
-        word_counter = Counter()
-
-        for words in data['text']:
-            words = words.strip().split()
-            for word in words:
-                word_counter[word] += 1
-
-        for word, count in word_counter.most_common():
-            if count >= self.min_count:
-                self._id2word.append(word)
-
-        label2name = {0: '科技', 1: '股票', 2: '体育', 3: '娱乐', 4: '时政', 5: '社会', 6: '教育', 7: '财经',
-                      8: '家居', 9: '游戏', 10: '房产', 11: '时尚', 12: '彩票', 13: '星座'}
-
-        label_counter = Counter(data['label'])
-
-        for label in range(len(label_counter)):
-            count = label_counter[label]
-            self._id2label.append(label)
-            self.target_names.append(label2name[label])
-
-    def load_pretrained_embs(self, embfile):
-        with open(embfile, encoding='utf-8') as f:
+    def load_vocab(self, df, vocab_file):
+        with open(vocab_file, 'r') as f:
             lines = f.readlines()
-            items = lines[0].split()
-            word_count, embedding_dim = int(items[0]), int(items[1])
+            id2word = list(map(lambda x: x.strip(), lines))
+            word2id = dict(zip(id2word, range(len(id2word))))
+            return id2word, word2id
 
-        vocab_size = self.word_size
-        embeddings = np.zeros((vocab_size, embedding_dim), dtype=np.float32)
-        # 词典中所有的索引值
-        all_index = np.array(range(vocab_size))
-        # 用于存放word2vec中的索引值
-        word2vec_index = np.array([0, 1])
-        count = 0
+    def tokenize(self, text):
+        text = text.strip().split()[:self.max_len-2]
+        actual_len = len(text) + 2
+        tokens = ['[PAD]']*self.max_len
+        tokens[:actual_len] = ["[CLS]"] + text + ["[SEP]"]
+        output_tokens = self.token2id(tokens)
+        return output_tokens
 
-        for i, line in enumerate(lines[1:], 1):
-            values = line.strip().split()
-            index = self._word2id.get(values[0], self.unk)
-            vector = np.array(values[1:], dtype=np.float)
+    # def tokenize(self, text):
+    #     total_seq_len = (self.max_len - 2) * self.segment_num
+    #     segment_seq_len = self.max_len - 2
+    #     tokens = [0] * (self.max_len * self.segment_num)
+    #     text = text.strip().split()[:total_seq_len]
+    #     for i in range(self.segment_num):
+    #
+    #
+    #
+    #     actual_len = len(text) + 2
+    #
+    #     tokens[:actual_len] = ["[CLS]"] + text + ["[SEP]"]
+    #     output_tokens = self.token2id(tokens)
+    #     return output_tokens
 
-            if index not in [self.pad, self.unk]:
-                embeddings[index] = vector
-                word2vec_index = np.append(word2vec_index, index)
-            embeddings[self.unk] += vector
-            count = i
-
-        # 获取word2vec中没有的word的index
-        diff_index = np.setdiff1d(all_index, word2vec_index, assume_unique=True)
-        embeddings[self.unk] = embeddings[self.unk] / count
-        embeddings[diff_index] = embeddings[self.unk]
-        # embeddings = embeddings / np.std(embeddings)
-
-        return embeddings
-
-
-    def word2id(self, xs):
+    def token2id(self, xs):
         if isinstance(xs, list):
             return [self._word2id.get(x, self.unk) for x in xs]
         return self._word2id.get(xs, self.unk)
 
-
-    def label2id(self, xs):
-        if isinstance(xs, list):
-            return [self._label2id.get(x, self.unk) for x in xs]
-        return self._label2id.get(xs, self.unk)
-
     @property
-    def word_size(self):
+    def vocab_size(self):
         return len(self._id2word)
 
-
     @property
-    def label_size(self):
-        return len(self._id2label)
-
-
-def preprocess(df, vocab):
-    texts = df['text'].to_list()
-    labels = df['label'].to_list()
-
-    texts = [vocab.word2id(text.strip().split()) for text in texts]
-    labels = vocab.label2id(labels)
-    return {'text': texts, 'label': labels}
+    def num_classes(self):
+        return self.num_label
 
 
 class NewsDataset(Dataset):
-    def __init__(self, df, seq_len=256, front=True):
-        inputs = df['text']
-        self.labels = torch.LongTensor(df['label'])
-        self.lens = torch.LongTensor([len(text) if len(text)<seq_len else seq_len for text in inputs])
-        # 统一相同的长度并变成LongTensor类型
-        self.inputs = torch.zeros(len(inputs), seq_len, dtype=torch.int64)
-        for i, text in enumerate(self.inputs):
-            if front:
-                self.inputs[i, :self.lens[i]] = torch.LongTensor(inputs[i][:seq_len])
-            else:
-                self.inputs[i, :self.lens[i]] = torch.LongTensor(inputs[i][-seq_len:])
-
+    def __init__(self, df, vocab):
+        inputs = df.text.apply(vocab.tokenize).to_list()
+        lens = [(np.sum(np.array(text)>0)).tolist() for text in inputs]
+        self.input_ids = torch.LongTensor(inputs)
+        self.targets = torch.LongTensor(df['label'].tolist())
+        self.lens = torch.LongTensor(lens)
+        self.token_type_ids = torch.zeros_like(self.input_ids)
+        self.attention_mask = (self.input_ids > 0).long()
 
     def __len__(self):
-        return len(self.inputs)
+        return len(self.input_ids)
 
     def __getitem__(self, item):
-        return {'text': self.inputs[item], 'len': self.lens[item], 'label': self.labels[item]}
+        return {'input_ids': self.input_ids[item],
+                'token_type_ids': self.token_type_ids[item],
+                'attention_mask': self.attention_mask[item],
+                'len': self.lens[item],
+                'target': self.targets[item]
+                }
 
 
-class TextCNN(nn.Module):
-    def __init__(self, vocab, emb_size, out_channels, word2vec_file, glove_file, filter_sizes=[2, 3, 4], drop=0.3):
-        super(TextCNN, self).__init__()
-        vocab_size = vocab.word_size
-        num_classes = vocab.label_size
-        self.emb = nn.Embedding(vocab_size, emb_size, padding_idx=0)
-
-        # 使用预训练的词向量
-        word2vec_embed = vocab.load_pretrained_embs(word2vec_file)
-        self.word2vec_embed = nn.Embedding.from_pretrained(torch.from_numpy(word2vec_embed), padding_idx=0)
-
-        # glove_embed = vocab.load_pretrained_embs(glove_file)
-        # self.glove_embed = nn.Embedding.from_pretrained(torch.from_numpy(glove_embed), padding_idx=0)
-
-        self.convs = nn.ModuleList([nn.Conv2d(1, out_channels, (k, emb_size)) for k in filter_sizes])
+class BertClassifier(nn.Module):
+    def __init__(self, vocab, bert_model_path, drop=0.3):
+        super(BertClassifier, self).__init__()
+        config = BertConfig.from_pretrained(bert_model_path+'config.json')
+        self.bert = BertModel.from_pretrained(bert_model_path+'pytorch_model.bin', config=config)
+        self.fc = nn.Linear(config.hidden_size, vocab.num_classes)
         self.dropout = nn.Dropout(drop)
-        self.fc = nn.Linear(len(filter_sizes) * out_channels, num_classes)
 
-    def forward(self, x):  # x.shape: (batch_size, seq_len)
-        emb1 = self.emb(x)  # x.shape: (batch_size, seq_len, emb_size)
-        # emb2 = torch.cat((self.word2vec_embed(x), self.glove_embed(x)), dim=2)  # x.shape: (batch_size, seq_len, 2*emb_size)
-        emb2 = self.word2vec_embed(x)
-        x = emb1 + emb2      # x.shape: (batch_size, seq_len, emb_size)
-        # x = torch.cat((emb1, emb2), dim=2)  # x.shape: (batch_size, seq_len, 2*emb_size)
-        x = self.dropout(x)
-
-        x = x.unsqueeze(1)  # x.shape: (batch_size, 1, seq_len, emb_size)
-
-        x = [F.relu(conv(x)).squeeze(3) for conv in self.convs]  # len(self.convs)*(batch_size, out_channels, w)
-        x = [F.max_pool1d(line, line.size(2)).squeeze(2) for line in x]  # len(self.convs)*(batch_size, out_channels)
-        x = torch.cat(x, dim=1)  # (batch, len(self.convs)*out_channels)
-        x = self.dropout(x)
-        return self.fc(x)
+    def forward(self, input_ids, attention_mask, token_type_ids):  # input_ids.shape: (batch_size, seq_len)
+        sequence_output, pooled_output = self.bert(input_ids=input_ids,
+                                                   attention_mask=attention_mask,
+                                                   token_type_ids=token_type_ids)
+        reps = sequence_output[:, 0, :]
+        reps = self.dropout(reps)
+        return self.fc(reps)
 
 
 class Optimizer:
     def __init__(self, model_parameters, lr, weight_decay=0, lr_scheduler=False):
-        self.optimizer = torch.optim.Adam(model_parameters, lr=lr, weight_decay=weight_decay)
+        # self.optimizer = torch.optim.Adam(model_parameters, lr=lr, weight_decay=weight_decay)
+        self.optimizer = AdamW(model.parameters(), lr=lr, weight_decay=weight_decay, correct_bias=False)
         # 每decay_step个epoch降低LR一次
         self.lr_scheduler = lr_scheduler
         if self.lr_scheduler:
@@ -225,7 +144,7 @@ class Trainer:
     state_dict_path: 模型保存路径
     prefix_model_name: 模型名称前缀
     """
-    def __init__(self, model, optimizer, loss_fn, state_dict_path='./state_dict', prefix_model_name='textcnn.model'):
+    def __init__(self, model, optimizer, loss_fn, state_dict_path='./state_dict', prefix_model_name='bert.model'):
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
         if torch.cuda.is_available():
@@ -300,10 +219,13 @@ class Trainer:
         all_predictions = []
         all_targets = []
         for i, data in data_iter:
-            inputs = data['text'].to(self.device)  # (batch, seq_len)
-            targets = data['label'].to(self.device)  # (batch)
+            inputs = data['input_ids'].to(self.device)  # (batch, seq_len)
+            token_type_ids = data['token_type_ids'].to(self.device)
+            attention_mask = data['attention_mask'].to(self.device)
+            targets = data['target'].to(self.device)  # (batch)
 
-            outputs = self.model(inputs)  # (batch, num_classes)
+
+            outputs = self.model(inputs, attention_mask, token_type_ids)  # (batch, num_classes)
             loss = self.loss_fn(outputs, targets)
 
             # 训练模式进行反向传播
@@ -363,9 +285,11 @@ class Trainer:
 
         with torch.no_grad():
             for i, data in data_iter:
-                input_ids = data['text'].to(self.device)
+                inputs = data['input_ids'].to(self.device)  # (batch, seq_len)
+                token_type_ids = data['token_type_ids'].to(self.device)
+                attention_mask = data['attention_mask'].to(self.device)
 
-                outputs = self.model(input_ids)
+                outputs = self.model(inputs, attention_mask, token_type_ids)
 
                 result = torch.max(outputs, 1)[1].cpu().numpy()
                 all_predictions.extend(result)
@@ -448,28 +372,25 @@ def delete_spec_file_subname(path, str):
         os.remove(path+file)
         print(f'Delete file {file}')
 
+
 if __name__ == '__main__':
-    # train_file = './corpus/tianchi_news/train_set.csv'
-    # test_file = './corpus/tianchi_news/test_a.csv'
     train_file = '../NLPFramework/corpus/tianchi_news/train_set.csv'
     test_file = '../NLPFramework/corpus/tianchi_news/test_a.csv'
+    vocab_file = '../NLPFramework/pre_trained_models/bert-mini/vocab.txt'
+    bert_model_path = '../NLPFramework/pre_trained_models/bert-mini/'
 
-    word2vec_file = '../NLPFramework/corpus/tianchi_news/word2vec_100.txt'
-    glove_file = '../NLPFramework/corpus/tianchi_news/glove_200.txt'
 
-    batch_size = 64
-    seq_len = 512
-    emb_size = 100
-    out_channels = 200
-    lr = 1e-2
-    drop = 0.5
+    batch_size = 32
+    seq_len = 256
+    lr = 1e-4
+    drop = 0.3
     l2_regu = 1e-3
 
     # 读取文件中的数据
     df_all = pd.read_csv(train_file, sep='\t')
 
     # 构建词典
-    vocab = NewsVocab(df_all)
+    vocab = Vocab(df_all, vocab_file, max_len=seq_len)
 
     # 训练集和验证集数据
     # df_train, df_val = train_test_split(df_all, test_size=0.2, random_state=10)
@@ -482,22 +403,19 @@ if __name__ == '__main__':
         print(f'Train data shape: {df_train.shape}')
         print(f'Validation data shape: {df_val.shape}')
 
-        #预处理数据
-        train_data = preprocess(df_train, vocab)
-        val_data = preprocess(df_val, vocab)
 
-        train_dataset = NewsDataset(train_data, seq_len=seq_len, front=True)
-        val_dataset = NewsDataset(val_data, seq_len=seq_len, front=True)
+        train_dataset = NewsDataset(df_train, vocab)
+        val_dataset = NewsDataset(df_val, vocab)
 
         train_dataloader = DataLoader(train_dataset, shuffle=True, batch_size=batch_size)
         val_dataloader = DataLoader(val_dataset, shuffle=False, batch_size=batch_size)
 
-        vocab_size = vocab.word_size
-        num_classes = vocab.label_size
+        vocab_size = vocab.vocab_size
+        num_classes = vocab.num_classes
 
         print(f'vocabulary size is {vocab_size}, num_classes is {num_classes}')
         # 创建模型 优化器  损失函数
-        model = TextCNN(vocab, emb_size, out_channels, word2vec_file, glove_file, drop=drop)
+        model = BertClassifier(vocab, bert_model_path, drop=drop)
         optimizer = Optimizer(model.parameters(), lr=lr, weight_decay=l2_regu)
         loss_fn = torch.nn.CrossEntropyLoss()
         trainer = Trainer(model, optimizer, loss_fn, state_dict_path='./state_dict')
@@ -508,8 +426,7 @@ if __name__ == '__main__':
 
         df_test = pd.read_csv(test_file, sep='\t')
         df_test['label'] = np.zeros(len(df_test), dtype=np.int)
-        test_data = preprocess(df_test, vocab)
-        test_dataset = NewsDataset(test_data, seq_len=seq_len, front=True)
+        test_dataset = NewsDataset(df_test, vocab)
         test_dataloader = DataLoader(test_dataset, shuffle=False, batch_size=batch_size)
 
         trainer.predict(test_dataloader, save_file=True, k=k+1)

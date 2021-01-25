@@ -1,0 +1,11 @@
+2021-01-23 15:03:14,027 INFO: Use cuda: True, gpu id: 0.
+2021-01-23 15:03:14,076 INFO: Fold lens [50, 50, 50, 50, 50, 50, 50, 50, 50, 50, 50, 50, 50, 50, 50, 50, 50, 50, 50, 50]
+2021-01-23 15:03:17,808 INFO: Build vocab: words 3890, labels 14.
+2021-01-23 15:03:17,814 INFO: Build Bert vocab with size 6982.
+2021-01-23 15:03:17,899 INFO: Build Bert encoder with pooled False.
+2021-01-23 15:03:19,608 INFO: Build model with bert word encoder, lstm sent encoder.
+2021-01-23 15:03:19,611 INFO: Model param num: 7.98 M.
+2021-01-23 15:03:24,108 INFO: Total 1000 docs.
+2021-01-23 15:03:24,307 INFO: Total 50 docs.
+2021-01-23 15:03:28,599 INFO: Total 1000 docs.
+2021-01-23 15:03:28,600 INFO: Start training...

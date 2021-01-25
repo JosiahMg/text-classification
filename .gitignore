@@ -4,7 +4,7 @@ checkpoints/
 corpus/
 *.bin
 for_test.ipynb
-test.py
+tmp.py
 config/__pycache__/
 models/__pycache__/
 preprocess/__pycache__/

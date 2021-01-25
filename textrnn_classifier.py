@@ -1,3 +1,7 @@
+import torch
+import torch.nn as nn
+import numpy as np
+
 import pandas as pd
 from collections import Counter
 import numpy as np
@@ -15,7 +19,7 @@ from sklearn.metrics import f1_score
 
 """
 任务: 多分类
-模型: TextCNN
+模型: TextRNN
 """
 
 
@@ -151,39 +155,52 @@ class NewsDataset(Dataset):
         return {'text': self.inputs[item], 'len': self.lens[item], 'label': self.labels[item]}
 
 
-class TextCNN(nn.Module):
-    def __init__(self, vocab, emb_size, out_channels, word2vec_file, glove_file, filter_sizes=[2, 3, 4], drop=0.3):
-        super(TextCNN, self).__init__()
+class TextRNN(nn.Module):
+    def __init__(self, vocab, emb_size, hidden_size, num_layers, bidirectional, word2vec_file, glove_file, drop=0.3):
+        super(TextRNN, self).__init__()
         vocab_size = vocab.word_size
         num_classes = vocab.label_size
         self.emb = nn.Embedding(vocab_size, emb_size, padding_idx=0)
 
+        if bidirectional:
+            directions = 2
+        else:
+            directions = 1
+
         # 使用预训练的词向量
         word2vec_embed = vocab.load_pretrained_embs(word2vec_file)
         self.word2vec_embed = nn.Embedding.from_pretrained(torch.from_numpy(word2vec_embed), padding_idx=0)
-
+        #
         # glove_embed = vocab.load_pretrained_embs(glove_file)
         # self.glove_embed = nn.Embedding.from_pretrained(torch.from_numpy(glove_embed), padding_idx=0)
 
-        self.convs = nn.ModuleList([nn.Conv2d(1, out_channels, (k, emb_size)) for k in filter_sizes])
+        self.rnn = nn.LSTM(emb_size, hidden_size, num_layers=num_layers, batch_first=True, bidirectional=bidirectional)
         self.dropout = nn.Dropout(drop)
-        self.fc = nn.Linear(len(filter_sizes) * out_channels, num_classes)
+        self.fc = nn.Linear(2*hidden_size*directions, num_classes)
 
-    def forward(self, x):  # x.shape: (batch_size, seq_len)
-        emb1 = self.emb(x)  # x.shape: (batch_size, seq_len, emb_size)
-        # emb2 = torch.cat((self.word2vec_embed(x), self.glove_embed(x)), dim=2)  # x.shape: (batch_size, seq_len, 2*emb_size)
-        emb2 = self.word2vec_embed(x)
-        x = emb1 + emb2      # x.shape: (batch_size, seq_len, emb_size)
-        # x = torch.cat((emb1, emb2), dim=2)  # x.shape: (batch_size, seq_len, 2*emb_size)
-        x = self.dropout(x)
+    def forward(self, x, lens):  # x.shape: (batch_size, seq_len)
 
-        x = x.unsqueeze(1)  # x.shape: (batch_size, 1, seq_len, emb_size)
+        lens_sorted, idx_sorted = lens.sort(0, descending=True)
+        x_sorted = x[idx_sorted]
 
-        x = [F.relu(conv(x)).squeeze(3) for conv in self.convs]  # len(self.convs)*(batch_size, out_channels, w)
-        x = [F.max_pool1d(line, line.size(2)).squeeze(2) for line in x]  # len(self.convs)*(batch_size, out_channels)
-        x = torch.cat(x, dim=1)  # (batch, len(self.convs)*out_channels)
-        x = self.dropout(x)
-        return self.fc(x)
+        emb1 = self.emb(x_sorted)  # x.shape: (batch_size, seq_len, emb_size)
+        emb2 = self.word2vec_embed(x_sorted)
+        emb = emb1 + emb2      # x.shape: (batch_size, seq_len, emb_size)
+        emb_drop = self.dropout(emb)
+
+        packed_seq = nn.utils.rnn.pack_padded_sequence(emb_drop, lens_sorted.long().cpu().data.numpy(), batch_first=True)
+
+        hiddens, _ = self.rnn(packed_seq)   # (batch, seq_len, hidden_size*bidirection)
+        unpacked, _ = nn.utils.rnn.pad_packed_sequence(hiddens, batch_first=True)
+
+        _, original_idx = idx_sorted.sort(0, descending=False)
+        output_seq = unpacked[original_idx.long()].contiguous()
+
+        pooled_avg = torch.mean(output_seq, dim=1)  # (batch, hidden_size*bidirection)
+        pooled_max, _ = torch.max(output_seq, dim=1)  # (batch, hidden_size*bidirection)
+        outputs = torch.cat((pooled_avg, pooled_max), dim=1)   # （batch, 2*hidden_size*bidirection)
+        outputs = self.dropout(outputs)
+        return self.fc(outputs)
 
 
 class Optimizer:
@@ -225,7 +242,7 @@ class Trainer:
     state_dict_path: 模型保存路径
     prefix_model_name: 模型名称前缀
     """
-    def __init__(self, model, optimizer, loss_fn, state_dict_path='./state_dict', prefix_model_name='textcnn.model'):
+    def __init__(self, model, optimizer, loss_fn, state_dict_path='./state_dict', prefix_model_name='textrnn.model'):
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
         if torch.cuda.is_available():
@@ -301,9 +318,10 @@ class Trainer:
         all_targets = []
         for i, data in data_iter:
             inputs = data['text'].to(self.device)  # (batch, seq_len)
+            lens = data['len'].to(self.device)  # (batch)
             targets = data['label'].to(self.device)  # (batch)
 
-            outputs = self.model(inputs)  # (batch, num_classes)
+            outputs = self.model(inputs, lens)  # (batch, num_classes)
             loss = self.loss_fn(outputs, targets)
 
             # 训练模式进行反向传播
@@ -364,8 +382,9 @@ class Trainer:
         with torch.no_grad():
             for i, data in data_iter:
                 input_ids = data['text'].to(self.device)
+                input_lens = data['len'].to(self.device)
 
-                outputs = self.model(input_ids)
+                outputs = self.model(input_ids, input_lens)
 
                 result = torch.max(outputs, 1)[1].cpu().numpy()
                 all_predictions.extend(result)
@@ -439,6 +458,7 @@ class Trainer:
                 return True
         return False
 
+
 def delete_spec_file_subname(path, str):
     dic_lis = [i for i in os.listdir(path)]
     print(dic_lis)
@@ -447,6 +467,33 @@ def delete_spec_file_subname(path, str):
     for file in dic_lis:
         os.remove(path+file)
         print(f'Delete file {file}')
+
+
+#  将path目录下的.csv文件统计并生成新的csv
+
+def merge_submit(path, match='.csv'):
+    files = []
+    for file in os.listdir(path):
+        if match in file:
+            files.append(file)
+
+    df_tmp = pd.read_csv(files[0])
+    n_classes = len(set(df_tmp.label.values))
+
+    all_labels = np.zeros((len(df_tmp), n_classes))
+    print(f"The shape of all_labels {all_labels.shape}")
+
+    for file in files:
+        df = pd.read_csv(file)
+        for i, label in enumerate(df.label.values):
+            all_labels[i, label] += 1
+
+    new_df = pd.DataFrame(columns=['label'])
+    new_df['label'] = all_labels.argmax(axis=1).astype(np.int)
+    new_df.to_csv("submit.csv", index=None)
+    return new_df['label']
+
+
 
 if __name__ == '__main__':
     # train_file = './corpus/tianchi_news/train_set.csv'
@@ -460,10 +507,12 @@ if __name__ == '__main__':
     batch_size = 64
     seq_len = 512
     emb_size = 100
-    out_channels = 200
+    hidden_size = 100
     lr = 1e-2
-    drop = 0.5
-    l2_regu = 1e-3
+    drop = 0.3
+    l2_regu = 1e-4
+    num_layers = 2
+    bidirectional = True
 
     # 读取文件中的数据
     df_all = pd.read_csv(train_file, sep='\t')
@@ -472,8 +521,9 @@ if __name__ == '__main__':
     vocab = NewsVocab(df_all)
 
     # 训练集和验证集数据
-    # df_train, df_val = train_test_split(df_all, test_size=0.2, random_state=10)
-    gkf = GroupKFold(n_splits=5).split(X=df_all, groups=df_all.index)
+    # df_train, df_val = train_test_split(df_all, test_size=0.1, random_state=10)
+
+    gkf = GroupKFold(n_splits=10).split(X=df_all, groups=df_all.index)
 
     for k, (train_idx, val_idx) in enumerate(gkf):
         print(f'-----Train k={k+1}-----')
@@ -497,7 +547,7 @@ if __name__ == '__main__':
 
         print(f'vocabulary size is {vocab_size}, num_classes is {num_classes}')
         # 创建模型 优化器  损失函数
-        model = TextCNN(vocab, emb_size, out_channels, word2vec_file, glove_file, drop=drop)
+        model = TextRNN(vocab, emb_size, hidden_size, num_layers, bidirectional, word2vec_file, glove_file, drop=drop)
         optimizer = Optimizer(model.parameters(), lr=lr, weight_decay=l2_regu)
         loss_fn = torch.nn.CrossEntropyLoss()
         trainer = Trainer(model, optimizer, loss_fn, state_dict_path='./state_dict')
@@ -513,5 +563,5 @@ if __name__ == '__main__':
         test_dataloader = DataLoader(test_dataset, shuffle=False, batch_size=batch_size)
 
         trainer.predict(test_dataloader, save_file=True, k=k+1)
-        delete_spec_file_subname(r'./state_dict/', r'epoch.')
 
+        delete_spec_file_subname(r'./state_dict/', r'epoch.')
